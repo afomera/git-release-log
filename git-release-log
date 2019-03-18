@@ -1,0 +1,123 @@
+#!/usr/bin/env ruby
+
+require 'graphql/client'
+require 'graphql/client/http'
+require 'optparse'
+
+# Major, Minor, Patch
+Version = [0, 1, 2].freeze
+
+class CommandArguments
+  def self.parse(args)
+    options = OpenStruct.new
+    options.verbose = false
+    options.label = 'release'
+
+    opt_parser = OptionParser.new do |opts|
+      opts.banner = 'Usage: `git release-log [options]`'
+      opts.separator('')
+
+      opts.on('-r', '--repository REPO', 'Repository of which you wish to pull PRs for. IE: ProctorU/cloud-functions') do |repo|
+        if repo.include?('/')
+          options.repo = repo
+        else
+          puts 'Error: Must include the full repository name. Example: ProctorU/cloud-functions'
+          exit
+        end
+      end
+
+      opts.on('-l', '--label LABEL', 'Label of which you want to list PRs for. Default: release') do |label|
+        options.label = label
+      end
+
+      opts.on_tail("-h", "--help", "Show this message") do
+        puts opts
+        exit
+      end
+
+      # Another typical switch to print the version.
+      opts.on_tail("-v", "--version", "Show version") do
+        puts ::Version.join('.')
+        exit
+      end
+    end
+
+    opt_parser.parse!(args)
+    options
+  end
+end
+
+module Github
+  # Grab the access token from the user git config
+  github_token = `git config integrate.github-token`.sub("\n",'')
+
+  if github_token.empty?
+    puts "Sorry you must configure your github access token with `git config --global integrate.github-token <insert token here>`"
+    exit
+  end
+
+  GITHUB_ACCESS_TOKEN = github_token
+
+  URL = 'https://api.github.com/graphql'
+  HttpAdapter = GraphQL::Client::HTTP.new(URL) do
+    def headers(context)
+      {
+        "Authorization" => "Bearer #{GITHUB_ACCESS_TOKEN}",
+        "User-Agent" => 'Ruby'
+      }
+    end
+  end
+  Schema = GraphQL::Client.load_schema(HttpAdapter)
+  Client = GraphQL::Client.new(schema: Schema, execute: HttpAdapter)
+
+  class PullRequests
+    PullRequestQuery =  Github::Client.parse <<-'GRAPHQL'
+      query($owner: String!, $repository: String!, $label: String!) {
+        repository(owner: $owner, name: $repository) {
+          pullRequests(first:50, orderBy: { field:CREATED_AT, direction:ASC }, states:OPEN, labels:[$label]) {
+            edges {
+              node {
+                title
+                url
+                baseRefName
+                headRefName
+                author { login }
+              }
+            }
+          }
+        }
+      }
+    GRAPHQL
+
+    def self.all(owner, repository, label = 'release')
+      response = Github::Client.query(PullRequestQuery, variables: { owner: owner, repository: repository, label: label })
+      if response.errors.any?
+        raise QueryExecutionError.new(response.errors[:data].join(", "))
+      else
+        response.data.repository.pull_requests.edges
+      end
+    end
+  end
+
+  class QueryExecutionError < StandardError; end
+end
+
+options = CommandArguments.parse(ARGV)
+
+unless options.repo
+  puts 'Must specify a repository with -r'
+  exit
+end
+
+owner = options.repo.split('/').first
+repo = options.repo.split('/').last
+label = options.label
+
+pull_requests = ::Github::PullRequests.all(owner, repo, label).map(&:node)
+
+puts '==============='
+puts repo + ' has ' + pull_requests.size.to_s + " Total PRs with the Label '#{label}'"
+puts '==============='
+pull_requests.each do |pr|
+  puts pr.title
+end
